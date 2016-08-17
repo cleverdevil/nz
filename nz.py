@@ -1,5 +1,6 @@
 from terminaltables import SingleTable
 
+import sys
 import click
 import arrow
 import untangle
@@ -9,11 +10,34 @@ import dateutil.parser
 
 
 class APIProxy(object):
-    def req(self, **params):
+    def req(self, parse=True, **params):
         params.update(dict(apikey=self.apikey))
-        return requests.get(self.endpoint, params=params)
+        response = requests.get(self.endpoint, params=params)
+
+        if self.debug:
+            click.echo('-'*80)
+            click.echo(response.url)
+            click.echo('-'*80)
+            click.echo(response.content)
+            click.echo('-'*80)
+
+        if parse:
+            return self._parse(response.text)
+        return response
+
+    def _parse(self, content):
+        result = untangle.parse(content)
+        try:
+            error = result.error
+        except:
+            return result
+        else:
+            click.echo('Error %s: %s' % (error['code'], error['description']))
+            sys.exit(0)
+
 
 proxy = APIProxy()
+
 
 def date(text, humanize=True):
     d = arrow.get(dateutil.parser.parse(text))
@@ -23,13 +47,19 @@ def date(text, humanize=True):
 
 
 @click.group()
-@click.option('--endpoint', envvar='NZ_ENDPOINT', required=True, help='The Newznab API endpoint to use.')
-@click.option('--apikey', envvar='NZ_APIKEY', required=True, help='API key for your Newznab endpoint.')
+@click.option('--endpoint', envvar='NZ_ENDPOINT', required=True,
+              help='The Newznab API endpoint to use.')
+@click.option('--apikey', envvar='NZ_APIKEY', required=True,
+              help='API key for your Newznab endpoint.')
+@click.option('--debug', default=False, is_flag=True,
+              help='Enable debug')
 @click.version_option()
-def cli(endpoint, apikey):
+def cli(endpoint, apikey, debug):
     '''Command line interface to Newznab API endpoints.'''
+
     proxy.endpoint = endpoint
     proxy.apikey = apikey
+    proxy.debug = debug
 
 
 @cli.command()
@@ -37,11 +67,17 @@ def cli(endpoint, apikey):
 @click.argument('query', default='')
 def search(category, query):
     '''Search for content.'''
+
     params = dict(t='search', cat=','.join(category))
     if query:
         params['q'] = query
-    response = proxy.req(**params).text
-    results = untangle.parse(response).rss.channel.item
+
+    results = proxy.req(**params)
+    try:
+        results = results.rss.channel.item
+    except:
+        results = []
+
     data = [('Title', 'Date', 'Size (GB)', 'GUID')]
 
     for result in results:
@@ -67,11 +103,12 @@ def categories():
 def list():
     '''List categories.'''
 
-    response = proxy.req(t='caps').text
-    cats = untangle.parse(response).caps.categories.category
+    cats = proxy.req(t='caps').caps.categories.category
 
     def _echo_category(category, level=0):
-        click.echo(('    '*level) + category['name'] + ' ' + '[' + category['id'] + ']')
+        click.echo(
+            '%s%s [%s]' % (('   ' * level), category['name'], category['id'])
+        )
 
         if level == 0:
             for subcategory in getattr(category, 'subcat', []):
@@ -86,13 +123,13 @@ def list():
 def nzb():
     '''Commands for a particular NZB.'''
 
+
 @nzb.command()
 @click.argument('guid')
 def details(guid):
     '''Get details about a particular NZB.'''
 
-    response = proxy.req(t='details', id=guid).text
-    details = untangle.parse(response).rss.channel.item
+    details = proxy.req(t='details', id=guid).rss.channel.item
     attrs = dict((e['name'], e['value']) for e in details.newznab_attr)
 
     data = [
@@ -112,10 +149,25 @@ def details(guid):
 def download(guid):
     '''Download the specified NZB.'''
 
-    response = proxy.req(t='get', id=guid).content
+    response = proxy.req(t='get', id=guid, parse=False).content
 
     filename = '%s.nzb' % guid
     with open(filename, 'wb') as nzb:
         nzb.write(response)
 
     click.echo('NZB has been downloaded to: %s' % filename)
+
+
+@nzb.command()
+@click.argument('guid')
+def nfo(guid):
+    '''Print NFO for specified NZB, if available.'''
+
+    response = proxy.req(t='info', id=guid, parse=False)
+    if 'No such function' in response.text:
+        response = proxy.req(t='getnfo', guid=guid, parse=False)
+
+    if 'error code="300"' in response.text:
+        click.echo('Release does not have an NFO file associated.')
+    else:
+        click.echo(response.content)
